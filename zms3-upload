@@ -1,0 +1,81 @@
+#!/usr/bin/python3 -B
+# Copyright 2018 Paul Ozog.  All rights reserved.
+"""Upload all staged events (from zms3-stage) to S3. This should be run in cron
+from a aws-equipped user.
+
+"""
+
+import argparse
+import fcntl
+import getpass
+import grp
+import os
+import subprocess
+import sys
+import zms3
+
+LOCAL_ZONEMINDER_DIR = '/usr/share/zoneminder/www/'
+
+# These are used to ensure only one instance of this script is running.
+_PID_FILE = '/tmp/zms3-upload.pid'
+_fp = open(_PID_FILE, 'w')
+def _ensure_no_other_process():
+    try:
+        fcntl.lockf(_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        print('Another instance is running; exiting.')
+        sys.exit(0)
+
+def _ensure_permissions():
+    user = getpass.getuser()
+    groups = [g.gr_name for g in grp.getgrall() if user in g.gr_mem]
+    assert 'www-data' in groups
+
+class Uploader:
+    def __init__(self, bucket, label):
+        self._bucket = bucket
+        self._label = label
+
+        self._zm_www_dir = LOCAL_ZONEMINDER_DIR
+
+        self._queue = zms3.StageQueue()
+
+    def _make_url(self, next_event):
+        """
+        Create S3 url of the form 's3://<bucket>/<directory>'.
+        """
+
+        # Strip LOCAL_ZONEMINDER_DIR from the beginning
+        event = os.path.relpath(next_event, self._zm_www_dir)
+
+        return 's3://%s/%s/%s' % (self._bucket, self._label, event)
+
+    def _upload(self, event, s3_url):
+        cmd = ['/usr/local/bin/aws', 's3', 'cp', event, s3_url, '--recursive']
+        process = subprocess.Popen(cmd)
+        if process.wait() != 0:
+            print('Error executing ' + ' '.join(cmd))
+            sys.exit(1)
+
+    def upload_all(self):
+        next_event = self._queue.pop()
+        while next_event is not None:
+            s3_url = self._make_url(next_event)
+            self._upload(next_event, s3_url)
+            next_event = self._queue.pop()
+
+def main():
+    _ensure_no_other_process()
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--bucket', required=True, help='S3 bucket, must exist')
+    parser.add_argument('--label', required=True,
+                        help='Directory to copy all uploads within --bucket')
+    args = parser.parse_args()
+
+    _ensure_permissions()
+    uploader = Uploader(args.bucket, args.label)
+    uploader.upload_all()
+
+if __name__ == '__main__':
+    sys.exit(main())
